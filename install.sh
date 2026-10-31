@@ -4,6 +4,7 @@
 #   sudo ./install.sh              # auto-detect a single USB HP printer
 #   sudo ./install.sh --list       # show detected printers and matching PPDs
 #   sudo ./install.sh --device <uri> --ppd <file> [--name <queue>]
+#   sudo ./install.sh --legacy      # older PCL3GUI photo printers that print solid black
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -11,10 +12,12 @@ OUT="$HERE/build"
 FILTER_DIR=/Library/Printers/HP/hpcups
 PPD_DIR=/Library/Printers/PPDs/Contents/Resources
 
-DEVICE=""; PPD=""; QUEUE=""; LIST=0
+DEVICE=""; PPD=""; QUEUE=""; LIST=0; KRGB=0; LEGACY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --list)   LIST=1; shift ;;
+    --legacy) LEGACY=1; shift ;;
+    --krgb)   KRGB=1; shift ;;
     --device) DEVICE="$2"; shift 2 ;;
     --ppd)    PPD="$2"; shift 2 ;;
     --name)   QUEUE="$2"; shift 2 ;;
@@ -110,6 +113,16 @@ echo "==> Installing PPD to $DEST"
 install -d -o root -g wheel -m 755 "$PPD_DIR"
 sed "s|^\*cupsFilter:.*|*cupsFilter: \"application/vnd.cups-raster 0 $FILTER_DIR/hpcups\"|" \
     "$PPD" > "$DEST"
+# --legacy: make hpcups format the job the way HP's older hpijs driver did for
+# PCL3GUI printers (Photosmart A-series and similar).  --krgb is the narrower
+# variant that only changes the raster descriptor.  See patches/ and README.
+if [ "$LEGACY" = "1" ]; then
+  echo "==> Enabling hpijs-style job stream (--legacy)"
+  printf '*HPLegacyPcl3Gui2: True\n' >> "$DEST"
+elif [ "$KRGB" = "1" ]; then
+  echo "==> Enabling KRGB raster descriptor only (--krgb)"
+  printf '*HPCrdType: "both"\n' >> "$DEST"
+fi
 chown root:wheel "$DEST"; chmod 644 "$DEST"
 
 echo "==> Creating queue"
