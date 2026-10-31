@@ -1,0 +1,180 @@
+Optional hpijs-style job stream for pcl3gui2 printers.
+
+HP's hpcups was never what HP tested the older PCL3GUI printers with (the
+DJ9xxVIP / Photosmart A-series "PSP470" class); those shipped with hpijs.
+hpcups' Pcl3Gui2 encapsulator formats the job differently in several ways,
+and at least the Photosmart A620 prints solid black when given it, while a
+stream from hpijs prints correctly.  This patch adds two PPD attributes:
+
+  *HPCrdType: "both"        send hpijs' two-component K + sRGB raster
+                            descriptor (crd "06 1F 00 02 ...") and an empty
+                            black plane with each row, instead of sRGB only.
+
+  *HPLegacyPcl3Gui2: True   everything above, plus: a Configure Image Data
+                            command (Esc*v6W, RGB / 8 bits per primary),
+                            print quality capped at 1 (hpijs never sent 2),
+                            no Esc*t#R raster-resolution command, an
+                            absolute cursor position (Esc*p#Y) before every
+                            row, Esc*b0Y after a skipped blank run so the
+                            printer resets its Mode 10 seed row, and a page
+                            ending in a bare form feed (no Esc*rC).
+
+Without either attribute the filter's output is unchanged.
+
+--- a/prnt/hpcups/CommonDefinitions.h
++++ b/prnt/hpcups/CommonDefinitions.h
+@@ -465,6 +465,8 @@
+     int                printer_platform_version;
+     int                pre_process_raster;
+     int                HPSPDClass;
++    int                crd_both;      /* PPD *HPCrdType: "both" -- send the K+sRGB (KRGB) CRD and a (empty) K plane per row */
++    int                legacy_pcl3gui2; /* PPD *HPLegacyPcl3Gui2: True -- format the whole job the way hpijs (DJ9xxVIP) did */
+     int 	       args_duplex_mode;
+ } JobAttributes;
+ 
+--- a/prnt/hpcups/HPCupsFilter.cpp
++++ b/prnt/hpcups/HPCupsFilter.cpp
+@@ -409,6 +409,25 @@
+     {
+         m_JA.HPSPDClass = atoi(attr->value);
+     }
++
++    // Older PCL3GUI printers (e.g. Photosmart A/PSP470 class) were driven by
++    // hpijs with a two-component K+sRGB raster descriptor.  Pcl3Gui2 always
++    // declares sRGB only; let a PPD ask for the hpijs-style descriptor.
++    m_JA.crd_both = 0;
++    if ((attr = ppdFindAttr(m_ppd, "HPCrdType", NULL)) != NULL &&
++        attr->value != NULL && !strcasecmp(attr->value, "both"))
++    {
++        m_JA.crd_both = 1;
++    }
++    // Go further and mimic hpijs' DJ9xxVIP job stream: KRGB descriptor, a
++    // Configure Image Data command, quality capped at 1, no raster
++    // resolution command, and an absolute cursor position before each row.
++    m_JA.legacy_pcl3gui2 = 0;
++    if ((attr = ppdFindAttr(m_ppd, "HPLegacyPcl3Gui2", NULL)) != NULL &&
++        attr->value != NULL && (!strcasecmp(attr->value, "true") || !strcmp(attr->value, "1")))
++    {
++        m_JA.legacy_pcl3gui2 = 1;
++    }
+     
+ 
+ // Get the encapsulation technology from ppd
+--- a/prnt/hpcups/Pcl3Gui2.h
++++ b/prnt/hpcups/Pcl3Gui2.h
+@@ -61,6 +61,10 @@
+     bool    speed_mech_enabled;
+     int     page_number;
+     bool    m_run_ernie_filter;
++    bool    m_legacy;       // hpijs-style job stream (see HPLegacyPcl3Gui2)
++    int     m_cur_row;      // absolute row for the per-row cursor command in legacy mode
++    virtual DRIVER_ERROR SendCAPy(int iOffset);
++    virtual DRIVER_ERROR FormFeed();
+     eCrdType    crd_type;
+ };
+ 
+--- a/prnt/hpcups/Pcl3Gui2.cpp
++++ b/prnt/hpcups/Pcl3Gui2.cpp
+@@ -39,6 +39,8 @@
+ {
+     speed_mech_enabled = true;
+     m_run_ernie_filter = true;
++    m_legacy = false;
++    m_cur_row = 0;
+     crd_type = eCrd_color_only;   // pcl3 printers support RGB only ref:hplip-1701
+     strcpy(m_szLanguage, "PCL3GUI");
+ }
+@@ -53,6 +55,10 @@
+     Pipeline    *head;
+     unsigned int width;
+     head = *pipeline;
++    m_legacy = (m_pJA->legacy_pcl3gui2 != 0);
++    if (m_pJA->crd_both || m_legacy) {
++        crd_type = eCrd_both;
++    }
+     if (m_pJA->e_duplex_mode != DUPLEXMODE_NONE ||
+         m_pJA->total_pages < 3) {
+ 	    speed_mech_enabled = false;
+@@ -124,8 +130,12 @@
+ 
+ //  Set media source, type, size and quality modes.
+ 
++    int print_quality = m_pQA->print_quality;
++    if (m_legacy && print_quality > 1) {
++        print_quality = 1;      // hpijs never sent quality 2 to these printers
++    }
+     sprintf(szStr, "\033&l%dH\033&l%dM\033&l%dA\033*o%dM", m_pJA->media_source, m_pQA->media_type,
+-            m_pMA->pcl_id, m_pQA->print_quality);
++            m_pMA->pcl_id, print_quality);
+ 
+ //  Now add media subtype
+ 
+@@ -136,6 +146,11 @@
+     szStr[i++] = (char) m_pQA->media_subtype & 0xFF;
+     addToHeader((const BYTE *) szStr, i);
+ 
++    if (m_legacy) {
++        // Configure Image Data: RGB colour space, direct-by-pixel, 8 bits per primary
++        addToHeader((const BYTE *) "\033*v6W\x02\x03\x03\x08\x08\x08", 11);
++    }
++
+     if (m_pJA->e_duplex_mode != DUPLEXMODE_NONE) {
+         addToHeader((const BYTE *) EnableDuplex, sizeof(EnableDuplex));
+         speed_mech_enabled = false;
+@@ -154,8 +169,10 @@
+     addToHeader((const BYTE *) szStr, strlen(szStr));
+ 
+     
+-    sprintf(szStr,"\033*t%dR", m_pQA->actual_vertical_resolution);
+-    addToHeader((const BYTE *) szStr, strlen(szStr));
++    if (!m_legacy) {
++        sprintf(szStr,"\033*t%dR", m_pQA->actual_vertical_resolution);
++        addToHeader((const BYTE *) szStr, strlen(szStr));
++    }
+ 
+     // another command that helps PCLviewer
+     unsigned int width = m_pMA->printable_width;
+@@ -243,12 +260,42 @@
+         top_margin = m_pMA->printable_start_y - ((m_pJA->mech_offset * m_pQA->actual_vertical_resolution)/1000);
+     }
+     addToHeader("\x1b*p%dY", top_margin);
++    m_cur_row = top_margin;
+     return err;
+ }
+ 
++DRIVER_ERROR Pcl3Gui2::SendCAPy(int iOffset)
++{
++    if (m_legacy) {
++        // Rows carry an absolute position, so the skip itself is bookkeeping,
++        // but the Mode 10 seed row was reset on our side (Mode10::Flush) and
++        // the printer must reset its copy too: hpijs sent Esc*b0Y for that.
++        m_cur_row += iOffset;
++        return this->Send((const BYTE *) "\033*b0Y", 5);
++    }
++    return Encapsulator::SendCAPy(iOffset);
++}
++
++DRIVER_ERROR Pcl3Gui2::FormFeed()
++{
++    if (m_legacy) {
++        // hpijs ended the page with a bare form feed, no Esc*rC.
++        return this->Send((const BYTE *) "\x0C", 1);
++    }
++    return Encapsulator::FormFeed();
++}
++
+ DRIVER_ERROR Pcl3Gui2::Encapsulate(RASTERDATA *InputRaster, bool bLastPlane)
+ {
+-    DRIVER_ERROR    err;
++    DRIVER_ERROR    err = NO_ERROR;
++    if (m_legacy) {
++        char    szPos[16];
++        int     n = sprintf(szPos, "\033*p%dY", m_cur_row++);
++        err = this->Send((const BYTE *) szPos, n);
++        if (err != NO_ERROR) {
++            return err;
++        }
++    }
+     if (crd_type != eCrd_color_only) {
+         err = encapsulateRaster(InputRaster->rasterdata[COLORTYPE_BLACK], InputRaster->rastersize[COLORTYPE_BLACK], COLORTYPE_BLACK);
+     }
